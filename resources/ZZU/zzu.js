@@ -1,10 +1,8 @@
 // 郑州大学 (ZZU) 拾光课程表适配脚本
-// 支持标准树维 EAMS 教务接口链与综合信息门户微服务日历排课双流水线
+// 支持树维新一代智慧教务系统（jwxt.zzu.edu.cn）与移动综合信息门户（info.s.zzu.edu.cn）双流水线
 
 (function () {
-    const MAX_SUPPORTED_WEEK = 60;
-
-    const EAMS_BASE_URLS = [
+    const JWXT_BASE_URLS = [
         "https://jwxt.zzu.edu.cn",
         "https://info.s.zzu.edu.cn",
         ""
@@ -50,52 +48,6 @@
         return true;
     }
 
-    function powerSplit(paramsRaw) {
-        const args = [];
-        let current = "";
-        let depth = 0;
-        let inQuote = false;
-        let quoteChar = "";
-
-        for (let i = 0; i < paramsRaw.length; i++) {
-            const char = paramsRaw[i];
-            if ((char === '"' || char === "'") && (i === 0 || paramsRaw[i - 1] !== "\\")) {
-                if (!inQuote) {
-                    inQuote = true;
-                    quoteChar = char;
-                } else if (char === quoteChar) {
-                    inQuote = false;
-                }
-            }
-            if (!inQuote) {
-                if (char === "(" || char === "[" || char === "{") depth++;
-                if (char === ")" || char === "]" || char === "}") depth--;
-            }
-            if (char === "," && depth === 0 && !inQuote) {
-                args.push(cleanArg(current));
-                current = "";
-            } else {
-                current += char;
-            }
-        }
-        args.push(cleanArg(current));
-        return args;
-    }
-
-    function cleanArg(value) {
-        const trimmed = value.trim();
-        if (trimmed === "null") return null;
-        return trimmed.replace(/^["']|["']$/g, "");
-    }
-
-    function cleanCourseName(name) {
-        return String(name || "未知课程").replace(/\([^()]*\)\s*$/, "").trim();
-    }
-
-    function cleanPosition(position) {
-        return String(position || "未知地点").replace(/\s+/g, " ").trim();
-    }
-
     function cleanString(str) {
         if (!str) return "";
         const s = String(str)
@@ -109,416 +61,243 @@
         return s;
     }
 
-    function parseWeeksBitmap(bitmap) {
-        const weeks = [];
-        const value = String(bitmap || "");
-        for (let week = 1; week < value.length && week <= MAX_SUPPORTED_WEEK; week++) {
-            if (value[week] === "1") weeks.push(week);
-        }
-        return weeks;
+    function calculateTotalWeeks(startDate, endDate) {
+        if (!startDate || !endDate) return 20;
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        const diffMs = end.getTime() - start.getTime();
+        if (diffMs <= 0) return 20;
+        const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+        return Math.min(Math.max(Math.ceil(diffDays / 7), 16), 30);
     }
 
-    function mergeContinuousLessons(lessons) {
-        if (!lessons || lessons.length === 0) return [];
+    // ──────────────────────────────────────────────────────────
+    // 树维新一代智慧教务系统流水线 (student/for-std/course-table)
+    // ──────────────────────────────────────────────────────────
 
-        const groups = {};
-        lessons.forEach(lesson => {
-            const key = `${lesson.name}|${lesson.teacher}|${lesson.position}|${lesson.day}`;
-            if (!groups[key]) {
-                groups[key] = {
-                    name: lesson.name,
-                    teacher: lesson.teacher,
-                    position: lesson.position,
-                    day: lesson.day,
-                    weeksMatrix: Array.from({ length: MAX_SUPPORTED_WEEK + 1 }, () => new Set())
-                };
+    async function fetchSemesters(baseUrl = "") {
+        try {
+            const res = await fetch(`${baseUrl}/student/for-std/course-table`, {
+                headers: {
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "x-requested-with": "XMLHttpRequest"
+                },
+                method: "GET",
+                credentials: "include"
+            });
+            if (!res.ok) return null;
+
+            const htmlText = await res.text();
+            if (!htmlText || !htmlText.includes("allSemesters")) return null;
+
+            let options = [];
+            if (typeof DOMParser !== "undefined") {
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(htmlText, "text/html");
+                const select = doc.getElementById("allSemesters") || doc.querySelector("#allSemesters");
+                if (select) {
+                    options = Array.from(select.querySelectorAll("option")).map(opt => ({
+                        label: opt.textContent.trim(),
+                        value: opt.value.trim(),
+                        selected: opt.hasAttribute("selected") || opt.selected
+                    })).filter(o => o.value && o.label);
+                }
             }
 
-            if (Array.isArray(lesson.weeks)) {
-                lesson.weeks.forEach(week => {
-                    if (Number.isInteger(week) && week > 0 && week <= MAX_SUPPORTED_WEEK) {
-                        for (let section = lesson.startSection; section <= lesson.endSection; section++) {
-                            groups[key].weeksMatrix[week].add(section);
+            if (options.length === 0) {
+                const selectMatch = htmlText.match(/<select[^>]*id=["']allSemesters["'][^>]*>([\s\S]*?)<\/select>/i);
+                if (selectMatch) {
+                    const optRegex = /<option[^>]*value=["']([^"']*)["'][^>]*>([\s\S]*?)<\/option>/gi;
+                    let m;
+                    while ((m = optRegex.exec(selectMatch[1])) !== null) {
+                        const val = m[1].trim();
+                        const label = m[2].replace(/<[^>]*>/g, "").trim();
+                        if (val && label) {
+                            options.push({ label, value: val, selected: m[0].includes("selected") });
                         }
                     }
-                });
-            }
-        });
-
-        const merged = [];
-        for (const key in groups) {
-            const group = groups[key];
-            const blockMap = {};
-
-            for (let week = 1; week < group.weeksMatrix.length; week++) {
-                const sections = Array.from(group.weeksMatrix[week]).sort((a, b) => a - b);
-                if (sections.length === 0) continue;
-
-                let start = sections[0];
-                let previous = sections[0];
-                for (let i = 1; i < sections.length; i++) {
-                    const current = sections[i];
-                    if (current === previous + 1) {
-                        previous = current;
-                    } else {
-                        const blockKey = `${start}-${previous}`;
-                        if (!blockMap[blockKey]) blockMap[blockKey] = [];
-                        blockMap[blockKey].push(week);
-                        start = current;
-                        previous = current;
-                    }
-                }
-
-                const blockKey = `${start}-${previous}`;
-                if (!blockMap[blockKey]) blockMap[blockKey] = [];
-                blockMap[blockKey].push(week);
-            }
-
-            for (const blockKey in blockMap) {
-                const [startSection, endSection] = blockKey.split("-").map(Number);
-                const sections = [];
-                for (let s = startSection; s <= endSection; s++) sections.push(s);
-                merged.push({
-                    name: group.name,
-                    teacher: group.teacher,
-                    position: group.position,
-                    day: group.day,
-                    startSection,
-                    endSection,
-                    sections,
-                    weeks: blockMap[blockKey]
-                });
-            }
-        }
-
-        merged.sort((a, b) => {
-            if (a.day !== b.day) return a.day - b.day;
-            if (a.startSection !== b.startSection) return a.startSection - b.startSection;
-            if (a.name !== b.name) return a.name.localeCompare(b.name);
-            return a.position.localeCompare(b.position);
-        });
-        return merged;
-    }
-
-    function parseTeacherName(block) {
-        const teachersMatch = block.match(/actTeachers\s*=\s*\[([\s\S]*?)\]\s*;/);
-        if (!teachersMatch) return "未知教师";
-
-        const names = [];
-        const nameRegex = /\bname\s*:\s*"([^"]+)"/g;
-        let match;
-        while ((match = nameRegex.exec(teachersMatch[1])) !== null) {
-            if (!names.includes(match[1])) names.push(match[1]);
-        }
-        return names.length > 0 ? names.join(",") : "未知教师";
-    }
-
-    function parseTaskActivities(html) {
-        const rawResults = [];
-        const unitCountMatch = html.match(/\bunitCount\s*=\s*(\d+)\s*;/);
-        const unitCount = unitCountMatch ? parseInt(unitCountMatch[1], 10) : 12;
-        const indexRegex = new RegExp(
-            `index\\s*=\\s*(\\d+)\\s*\\*\\s*(?:unitCount|${unitCount})\\s*\\+\\s*(\\d+)\\s*;`,
-            "g"
-        );
-        const blocks = html.split(/var\s+teachers\s*=/);
-
-        for (let i = 1; i < blocks.length; i++) {
-            const block = blocks[i];
-            const teacher = parseTeacherName(block);
-            const activityRegex = /new\s+TaskActivity\(([\s\S]*?)\)\s*;/g;
-            const activities = [];
-            let activityMatch;
-            while ((activityMatch = activityRegex.exec(block)) !== null) {
-                activities.push({
-                    argsRaw: activityMatch[1],
-                    start: activityMatch.index,
-                    end: activityRegex.lastIndex
-                });
-            }
-
-            for (let activityIndex = 0; activityIndex < activities.length; activityIndex++) {
-                const activity = activities[activityIndex];
-                const args = powerSplit(activity.argsRaw);
-                if (args.length < 7) continue;
-
-                const name = cleanCourseName(args[3]);
-                const position = cleanPosition(args[5]);
-                const weeks = parseWeeksBitmap(args[6]);
-                if (weeks.length === 0) continue;
-
-                const nextActivityStart = activityIndex + 1 < activities.length
-                    ? activities[activityIndex + 1].start
-                    : block.length;
-                const activityScope = block.slice(activity.end, nextActivityStart);
-                indexRegex.lastIndex = 0;
-                let indexMatch;
-                while ((indexMatch = indexRegex.exec(activityScope)) !== null) {
-                    const rawDay = parseInt(indexMatch[1], 10);
-                    const rawSection = parseInt(indexMatch[2], 10);
-                    if (rawDay < 0 || rawDay > 6 || rawSection < 0 || rawSection >= unitCount) continue;
-
-                    const day = rawDay + 1;
-                    const section = rawSection + 1;
-                    rawResults.push({
-                        name,
-                        teacher,
-                        position,
-                        day,
-                        startSection: section,
-                        endSection: section,
-                        weeks: [...weeks]
-                    });
                 }
             }
-        }
 
-        return mergeContinuousLessons(rawResults);
+            if (options.length === 0) return null;
+
+            let studentId = null;
+            const dataIdMatch = htmlText.match(/var\s+dataId\s*=\s*(\d+)/) || htmlText.match(/dataId\s*[:=]\s*["']?(\d+)["']?/);
+            if (dataIdMatch) studentId = dataIdMatch[1];
+
+            return {
+                options,
+                studentId
+            };
+        } catch (e) {
+            return null;
+        }
     }
 
-    function parseParameters(html) {
-        if (!html) return null;
-        let ids = null;
-        const bgMatch = html.match(/bg\.form\.addInput\(\s*form\s*,\s*["']ids["']\s*,\s*["'](\d+)["']\s*\)/);
-        if (bgMatch) {
-            ids = bgMatch[1];
-        } else {
-            const inputMatch = html.match(/<input[^>]*name=["']ids["'][^>]*value=["'](\d+)["']/i) ||
-                               html.match(/<input[^>]*value=["'](\d+)["'][^>]*name=["']ids["']/i);
-            if (inputMatch) ids = inputMatch[1];
-        }
-
-        const tagIdMatch = html.match(/id=["'](semesterBar\d+Semester)["']/);
-        if (!ids || !tagIdMatch) return null;
-
-        const tagId = tagIdMatch[1];
-        const escapedTagId = tagId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const elementMatch = html.match(new RegExp(`<[^>]*\\bid=["']${escapedTagId}["'][^>]*>`, "i"));
-        const valueMatch = elementMatch ? elementMatch[0].match(/\bvalue=["'](\d+)["']/i) : null;
-
-        return {
-            ids,
-            tagId,
-            currentSemesterId: valueMatch ? valueMatch[1] : null
-        };
-    }
-
-    function parseSemesterResponse(raw) {
-        const data = Function(`return (${raw});`)();
-        const semesters = [];
-
-        for (const key of Object.keys(data.semesters || {})) {
-            const entries = Array.isArray(data.semesters[key]) ? data.semesters[key] : [];
-            entries.forEach(semester => {
-                if (semester && semester.id !== undefined) {
-                    const term = String(semester.name || "").trim();
-                    const label = /^第.*学期$/.test(term) ? term : `第${term}学期`;
-                    semesters.push({
-                        id: String(semester.id),
-                        schoolYear: String(semester.schoolYear || ""),
-                        term,
-                        name: `${semester.schoolYear} ${label}`.trim()
-                    });
-                }
+    async function fetchSemesterMetadata(baseUrl, semesterId) {
+        try {
+            const res = await fetch(`${baseUrl}/student/ws/semester/get/${semesterId}`, {
+                headers: {
+                    "accept": "*/*",
+                    "x-requested-with": "XMLHttpRequest"
+                },
+                method: "GET",
+                credentials: "include"
             });
+            if (!res.ok) return { startDate: null, endDate: null };
+            const data = await res.json();
+            return {
+                startDate: data.startDate || null,
+                endDate: data.endDate || null
+            };
+        } catch (e) {
+            return { startDate: null, endDate: null };
+        }
+    }
+
+    async function fetchAndParseNewJwxtCourses(baseUrl, semesterId, studentId = null) {
+        const urls = [
+            `${baseUrl}/student/for-std/course-table/semester/${semesterId}/print-data?semesterId=${semesterId}&hasExperiment=true`
+        ];
+        if (studentId) {
+            urls.push(`${baseUrl}/student/for-std/course-table/semester/${semesterId}/print-data/${studentId}`);
         }
 
-        semesters.sort((a, b) => {
-            const yearCompare = b.schoolYear.localeCompare(a.schoolYear);
-            if (yearCompare !== 0) return yearCompare;
-            return b.term.localeCompare(a.term, undefined, { numeric: true });
-        });
-
-        return {
-            semesters,
-            currentSemesterId: data.semesterId === undefined ? null : String(data.semesterId)
-        };
-    }
-
-    function normalizeNumericDate(year, month, day) {
-        const yearNumber = Number(year);
-        const monthNumber = Number(month);
-        const dayNumber = Number(day);
-        const date = new Date(Date.UTC(yearNumber, monthNumber - 1, dayNumber));
-        if (
-            date.getUTCFullYear() !== yearNumber ||
-            date.getUTCMonth() + 1 !== monthNumber ||
-            date.getUTCDate() !== dayNumber
-        ) {
-            return null;
-        }
-
-        return [
-            String(yearNumber).padStart(4, "0"),
-            String(monthNumber).padStart(2, "0"),
-            String(dayNumber).padStart(2, "0")
-        ].join("-");
-    }
-
-    function parseCalendarInfo(html) {
-        const text = String(html || "")
-            .replace(/<[^>]*>/g, " ")
-            .replace(/&nbsp;|&#160;|&#x0*A0;/gi, " ")
-            .replace(/\u00a0/g, " ");
-        const match = text.match(
-            /开始\s*\/\s*结束日期\s*[：:]?\s*(\d{4})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})\s*~\s*(\d{4})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})\s*\(\s*(\d+)\s*\)/
-        );
-        if (!match) return null;
-
-        const semesterStartDate = normalizeNumericDate(match[1], match[2], match[3]);
-        const semesterEndDate = normalizeNumericDate(match[4], match[5], match[6]);
-        const semesterTotalWeeks = Number(match[7]);
-        if (
-            !semesterStartDate ||
-            !semesterEndDate ||
-            semesterEndDate < semesterStartDate ||
-            !Number.isInteger(semesterTotalWeeks) ||
-            semesterTotalWeeks < 1 ||
-            semesterTotalWeeks > MAX_SUPPORTED_WEEK
-        ) {
-            return null;
-        }
-
-        return {
-            semesterStartDate,
-            semesterEndDate,
-            semesterTotalWeeks,
-            firstDayOfWeek: 1
-        };
-    }
-
-    function getZzuTimeSlots() {
-        return ZZU_TIME_SLOTS.map(slot => ({ ...slot }));
-    }
-
-    async function request(url, options = {}) {
-        const response = await fetch(url, { credentials: "include", ...options });
-        if (!response.ok) throw new Error(`网络请求失败: ${response.status}`);
-        return await response.text();
-    }
-
-    async function detectParameters() {
-        for (const base of EAMS_BASE_URLS) {
+        for (const url of urls) {
             try {
-                const url = `${base}/eams/courseTableForStd.action`;
-                const html = await request(url);
-                if (html && (html.includes("semesterBar") || html.includes("ids"))) {
-                    const params = parseParameters(html);
-                    if (params) {
-                        return { ...params, baseUrl: base };
+                const res = await fetch(url, {
+                    headers: {
+                        "accept": "*/*",
+                        "x-requested-with": "XMLHttpRequest"
+                    },
+                    method: "GET",
+                    credentials: "include"
+                });
+                if (!res.ok) continue;
+                const data = await res.json();
+                if (!data) continue;
+
+                const rawActivities = (data.studentTableVms && data.studentTableVms[0] ? data.studentTableVms[0].activities : (data.studentTableVm ? data.studentTableVm.activities : (data.activities || []))) || [];
+                if (!Array.isArray(rawActivities) || rawActivities.length === 0) continue;
+
+                const parsedCourses = [];
+                for (const act of rawActivities) {
+                    if (!act.courseName || !act.weekday || !act.startUnit || !act.endUnit || !Array.isArray(act.weekIndexes)) {
+                        continue;
                     }
+
+                    const teacherName = Array.isArray(act.teachers) && act.teachers.length > 0
+                        ? act.teachers.map(t => String(t).replace(/\(\d+\)/g, "").replace(/\[\d+\]/g, "").trim()).filter(Boolean).join(",")
+                        : (typeof act.teachers === "string" ? act.teachers.replace(/\(\d+\)/g, "").trim() : "");
+
+                    const weeks = act.weekIndexes.map(Number).filter(w => Number.isInteger(w) && w > 0).sort((a, b) => a - b);
+                    if (weeks.length === 0) continue;
+
+                    const startSection = Number(act.startUnit);
+                    const endSection = Number(act.endUnit);
+                    const sections = [];
+                    for (let s = startSection; s <= endSection; s++) sections.push(s);
+
+                    parsedCourses.push({
+                        name: cleanString(act.courseName),
+                        teacher: cleanString(teacherName),
+                        position: cleanString(act.room || act.building || "未知地点"),
+                        day: Number(act.weekday),
+                        startSection: startSection,
+                        endSection: endSection,
+                        sections: sections,
+                        weeks: weeks
+                    });
+                }
+
+                if (parsedCourses.length > 0) {
+                    return parsedCourses;
                 }
             } catch (e) {}
         }
         return null;
     }
 
-    async function getSelectedSemester(baseUrl, tagId, currentSemesterId) {
-        const form = new URLSearchParams();
-        form.set("tagId", tagId);
-        form.set("dataType", "semesterCalendar");
-        if (currentSemesterId) form.set("value", currentSemesterId);
-        form.set("empty", "false");
+    async function runNewJwxtFlow() {
+        for (const base of JWXT_BASE_URLS) {
+            try {
+                const semData = await fetchSemesters(base);
+                if (!semData || !semData.options || semData.options.length === 0) continue;
 
-        const raw = await request(`${baseUrl}/eams/dataQuery.action`, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-            body: form.toString()
-        });
-        const parsed = parseSemesterResponse(raw);
-        if (!parsed || parsed.semesters.length === 0) throw new Error("未获取到可选学期");
+                const labels = semData.options.map(s => s.label);
+                let defaultIndex = semData.options.findIndex(s => s.selected);
+                if (defaultIndex < 0) defaultIndex = 0;
 
-        const selectedId = currentSemesterId || parsed.currentSemesterId;
-        let defaultIndex = parsed.semesters.findIndex(semester => semester.id === selectedId);
-        if (defaultIndex < 0) defaultIndex = 0;
+                const selectedIndex = await window.shiguangBridgePromise.showSingleSelection(
+                    "选择学期",
+                    JSON.stringify(labels),
+                    defaultIndex
+                );
 
-        const index = await window.shiguangBridgePromise.showSingleSelection(
-            "选择学期",
-            JSON.stringify(parsed.semesters.map(semester => semester.name)),
-            defaultIndex
-        );
-        return Number.isInteger(index) && index >= 0 && index < parsed.semesters.length
-            ? parsed.semesters[index]
-            : null;
-    }
+                if (selectedIndex === null || selectedIndex < 0 || selectedIndex >= semData.options.length) {
+                    toast("操作已取消");
+                    return true;
+                }
 
-    async function fetchAndParseCourses(baseUrl, semesterId, ids) {
-        const form = new URLSearchParams();
-        form.set("ignoreHead", "1");
-        form.set("setting.kind", "std");
-        form.set("startWeek", "");
-        form.set("semester.id", String(semesterId));
-        form.set("ids", String(ids));
+                const selectedSemester = semData.options[selectedIndex];
+                toast("正在拉取课表数据...");
 
-        const html = await request(`${baseUrl}/eams/courseTableForStd!courseTable.action`, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-            body: form.toString()
-        });
-        return parseTaskActivities(html);
-    }
+                const [meta, courses] = await Promise.all([
+                    fetchSemesterMetadata(base, selectedSemester.value),
+                    fetchAndParseNewJwxtCourses(base, selectedSemester.value, semData.studentId)
+                ]);
 
-    async function fetchCalendarInfo(baseUrl, semesterId) {
-        const form = new URLSearchParams();
-        form.set("version", "1");
-        form.set("semesterId", String(semesterId));
+                if (!courses || courses.length === 0) {
+                    toast("未查询到有效课程数据");
+                    return false;
+                }
 
-        const html = await request(`${baseUrl}/eams/base/calendar-info.action`, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
-            body: form.toString()
-        });
-        const calendarInfo = parseCalendarInfo(html);
-        if (!calendarInfo) throw new Error("未能解析学期日历");
-        return calendarInfo;
-    }
+                let totalWeeks = 20;
+                if (meta && meta.startDate && meta.endDate) {
+                    totalWeeks = calculateTotalWeeks(meta.startDate, meta.endDate);
+                } else {
+                    const allWeeks = courses.flatMap(c => c.weeks || []);
+                    if (allWeeks.length > 0) totalWeeks = Math.max(...allWeeks);
+                }
 
-    async function trySaveCalendarInfo(baseUrl, semesterId) {
-        try {
-            const calendarInfo = await fetchCalendarInfo(baseUrl, semesterId);
-            if (window.shiguangBridgePromise && window.shiguangBridgePromise.saveCourseConfig) {
-                const saveResult = await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify({
-                    semesterStartDate: calendarInfo.semesterStartDate,
-                    semesterTotalWeeks: calendarInfo.semesterTotalWeeks,
-                    firstDayOfWeek: calendarInfo.firstDayOfWeek
-                }));
-                return saveResult === true;
+                const configData = {
+                    semesterStartDate: meta && meta.startDate ? meta.startDate : "",
+                    semesterTotalWeeks: Math.max(totalWeeks, 18),
+                    firstDayOfWeek: 1,
+                    defaultClassDuration: 45,
+                    defaultBreakDuration: 10
+                };
+
+                if (window.shiguangBridgePromise && window.shiguangBridgePromise.saveCourseConfig) {
+                    await window.shiguangBridgePromise.saveCourseConfig(JSON.stringify(configData));
+                }
+
+                if (window.shiguangBridgePromise && window.shiguangBridgePromise.savePresetTimeSlots) {
+                    await window.shiguangBridgePromise.savePresetTimeSlots(JSON.stringify(ZZU_TIME_SLOTS));
+                }
+
+                if (window.shiguangBridgePromise && window.shiguangBridgePromise.saveImportedCourses) {
+                    const saveOk = await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses));
+                    if (!saveOk) {
+                        toast("课程保存失败");
+                        return true;
+                    }
+                }
+
+                toast(`导入成功！共解析 ${courses.length} 门课程，已同步学期日期与作息时间。`);
+                if (window.shiguangBridge && window.shiguangBridge.notifyTaskCompletion) {
+                    window.shiguangBridge.notifyTaskCompletion();
+                }
+                return true;
+            } catch (e) {
+                console.warn("[ZZU New Jwxt Pipeline Exception]", e);
             }
-            return false;
-        } catch (error) {
-            console.warn(`[ZZU EAMS 学期信息设置失败] ${error.message}`);
-            return false;
         }
-    }
-
-    async function trySaveTimeSlots() {
-        try {
-            if (window.shiguangBridgePromise && window.shiguangBridgePromise.savePresetTimeSlots) {
-                const saveResult = await window.shiguangBridgePromise.savePresetTimeSlots(JSON.stringify(getZzuTimeSlots()));
-                return saveResult === true;
-            }
-            return false;
-        } catch (error) {
-            console.warn(`[ZZU 作息时间设置失败] ${error.message}`);
-            return false;
-        }
-    }
-
-    function buildCompletionMessage(calendarSaved, timeSlotsSaved, courseCount) {
-        if (calendarSaved && timeSlotsSaved) {
-            return `导入成功！共解析 ${courseCount} 门课程，已同步学期日期与郑大作息`;
-        }
-        if (!calendarSaved && !timeSlotsSaved) {
-            return `导入成功！共解析 ${courseCount} 门课程。学期日期与作息设置失败，请在设置中确认`;
-        }
-        if (!calendarSaved) {
-            return `导入成功！共解析 ${courseCount} 门课程。学期日期获取失败，请在设置中确认`;
-        }
-        return `导入成功！共解析 ${courseCount} 门课程，已同步作息时间`;
+        return false;
     }
 
     // ──────────────────────────────────────────────────────────
-    // 微服务日历排课兜底流水线
+    // 移动微服务日历排课兜底流水线 (info.s.zzu.edu.cn)
     // ──────────────────────────────────────────────────────────
 
     function scanTokens() {
@@ -668,7 +447,7 @@
                     if (!place) place = "教学楼";
 
                     let teacher = cleanString(item.teacher || item.teacherName || item.jsxm || item.js || "");
-                    
+
                     const m = name.match(/^(.*?)[(（]([^\d()（）\s]{2,6})[)）]$/);
                     if (m) {
                         name = m[1].trim();
@@ -858,7 +637,7 @@
     // 主执行入口
     // ──────────────────────────────────────────────────────────
 
-    async function runImportFlow() {
+    async function runZzuImport() {
         try {
             const currentUrl = window.location.href;
 
@@ -871,43 +650,14 @@
             }
 
             toast("正在探测郑大教务系统参数...");
-            let eamsSuccess = false;
+            const jwxtSuccess = await runNewJwxtFlow();
 
-            try {
-                const params = await detectParameters();
-                if (params) {
-                    const semester = await getSelectedSemester(params.baseUrl, params.tagId, params.currentSemesterId);
-                    if (semester) {
-                        toast("正在同步教务课表...");
-                        const courses = await fetchAndParseCourses(params.baseUrl, semester.id, params.ids);
-                        if (courses && courses.length > 0) {
-                            if (window.shiguangBridgePromise && window.shiguangBridgePromise.saveImportedCourses) {
-                                const saveResult = await window.shiguangBridgePromise.saveImportedCourses(JSON.stringify(courses));
-                                if (!saveResult) throw new Error("课程保存失败");
-                            }
-
-                            const calendarSaved = await trySaveCalendarInfo(params.baseUrl, semester.id);
-                            const timeSlotsSaved = await trySaveTimeSlots();
-                            toast(buildCompletionMessage(calendarSaved, timeSlotsSaved, courses.length));
-                            if (window.shiguangBridge && window.shiguangBridge.notifyTaskCompletion) {
-                                window.shiguangBridge.notifyTaskCompletion();
-                            }
-                            eamsSuccess = true;
-                        }
-                    } else {
-                        return;
-                    }
-                }
-            } catch (eamsError) {
-                console.warn("[ZZU EAMS 流水线异常，尝试微服务兜底]", eamsError.message);
-            }
-
-            if (!eamsSuccess) {
+            if (!jwxtSuccess) {
                 const fallbackOk = await runMicroserviceFallback();
                 if (!fallbackOk) {
                     await alertUser(
                         "未获取到课表数据",
-                        "请确认已成功登录郑大教务系统或信息门户。"
+                        "请确认已成功登录郑大新一代智慧教务系统或信息门户。"
                     );
                 }
             }
@@ -920,23 +670,20 @@
     if (typeof module !== "undefined" && module.exports) {
         module.exports = {
             ZZU_TIME_SLOTS,
-            powerSplit,
-            parseWeeksBitmap,
-            mergeContinuousLessons,
-            parseTeacherName,
-            parseTaskActivities,
-            parseParameters,
-            parseSemesterResponse,
-            parseCalendarInfo,
+            cleanString,
+            calculateTotalWeeks,
+            fetchSemesters,
+            fetchSemesterMetadata,
+            fetchAndParseNewJwxtCourses,
+            runNewJwxtFlow,
             scanTokens,
             calculateSectionCount,
             mapTimeToSection,
             aggregateEventsToCourses,
-            detectParameters,
-            runImportFlow
+            runZzuImport
         };
     } else {
-        runImportFlow();
+        runZzuImport();
     }
 })();
 
